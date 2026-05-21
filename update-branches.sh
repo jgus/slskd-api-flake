@@ -1,6 +1,6 @@
 #!/usr/bin/env -S nix shell nixpkgs#bash nixpkgs#git nixpkgs#curl nixpkgs#jq nixpkgs#gnused nixpkgs#coreutils --command bash
 
-# Per-version branch orchestrator. Runs on main, exactly once per workflow run.
+# Per-version branch orchestrator. Runs on main, once per workflow run.
 #
 # For each upstream version >= $MINIMUM_TRACKING_VERSION, ensures:
 #   - an exact branch `v<M>.<m>.<p>` exists and its pin is hash-validated
@@ -10,11 +10,13 @@
 # Single knob: $MINIMUM_TRACKING_VERSION env var. Permanent pins are done via
 # git tags (which the action never touches); there is no in-band freeze list.
 #
-# The flake-specific bit is `list_upstream_versions` below — every other flake
-# in this family copies this script and edits only that function.
+# Structural: each existing exact branch is `git merge`d with origin/main before its update-version runs, so orchestrator/workflow improvements that land on main propagate forward through every branch's tree. Branch-owned files (pin.nix, flake.lock, flake.nix) stay as-is via the `ours` merge driver declared in .gitattributes.
+#
+# Failures: per-branch update-version failures are surfaced as GH Actions ::warning:: annotations + a step summary, and cause a non-zero exit at the end of the run (so scheduled-run failures trigger the standard GH email notification).
+#
+# The flake-specific bit is `list_upstream_versions` below — every other flake in this family copies this script and edits only that function and `write_placeholder_pin`.
 
 set -euo pipefail
-
 : "${MINIMUM_TRACKING_VERSION:?required env var}"
 
 FLAKE_ROOT="${FLAKE_ROOT:-${PWD}}"
@@ -27,20 +29,33 @@ list_upstream_versions() {
     | jq -r '.releases | to_entries[] | select(.value | any(.packagetype == "sdist")) | .key'
 }
 
-# --- Semver helpers (sort -V is good enough for our purposes) ---
+# --- Flake-specific: write a placeholder pin.nix with the requested version, empty hashes. ---
+write_placeholder_pin() {
+  local v="$1"
+  cat > pin.nix <<EOF
+{
+  version = "${v}";
+  hash = "";
+}
+EOF
+}
+
 version_lt() { [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
 
-# --- Identify ourselves to git ---
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+# Define the `ours` merge driver so .gitattributes' `merge=ours` rules take effect: `true` exits 0 without touching the file, leaving the branch's version.
+git config merge.ours.driver true
 
-# --- Discover & filter upstream versions ---
 echo "Querying upstream..."
 mapfile -t raw_versions < <(list_upstream_versions)
-# Keep only x.y.z (or x.y.z-suffix) tags; strip leading v if present.
+if (( ${#raw_versions[@]} == 0 )); then
+  echo "error: list_upstream_versions returned no rows (auth issue?)" >&2
+  exit 1
+fi
 declare -a all_versions=()
 for v in "${raw_versions[@]}"; do
-  v="${v#v}"
+  v="${v#[Vv]}"
   if [[ "${v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+a-zA-Z0-9.]+)?$ ]]; then
     all_versions+=("${v}")
   fi
@@ -59,9 +74,10 @@ fi
 mapfile -t tracked < <(printf '%s\n' "${tracked[@]}" | sort -V)
 echo "Tracking ${#tracked[@]} upstream versions: ${tracked[*]}"
 
-# --- Ensure each exact branch exists and its hash is current ---
 git fetch --quiet origin
 main_sha=$(git rev-parse --verify origin/main)
+
+declare -a failed=()
 
 for v in "${tracked[@]}"; do
   branch="v${v}"
@@ -71,45 +87,57 @@ for v in "${tracked[@]}"; do
     echo "=== Refreshing existing branch ${branch}"
     git fetch --quiet origin "${branch}:refs/remotes/origin/${branch}" || true
     git worktree add -B "${branch}" "${wt}" "origin/${branch}" >/dev/null
+    # Merge orchestrator/workflow improvements from main; branch-owned files (pin.nix, flake.lock, flake.nix) stay as-is per .gitattributes. No-op merges are silent.
+    (cd "${wt}" && git merge --no-edit origin/main)
   else
     echo
     echo "=== Creating new branch ${branch} from main"
     git worktree add -B "${branch}" "${wt}" "${main_sha}" >/dev/null
-    # Reset pin.hash so update-version is forced to compute it.
-    cat > "${wt}/pin.nix" <<EOF
-{
-  version = "${v}";
-  hash = "";
-}
-EOF
+    (cd "${wt}" && write_placeholder_pin "${v}")
   fi
   pushd "${wt}" >/dev/null
-  # Bump nixpkgs first so update-version (and the build that re-validates the hash) runs against current nixpkgs. Hashes don't depend on nixpkgs for PyPI fetchers, but keeping flake.lock fresh is hygiene for consumers and ensures main (as an aggregate pointer to whichever exact branch wins) inherits a recent lock.
+  set +e
   nix flake update --option post-build-hook ""
   FLAKE_ROOT="${wt}" nix run --option post-build-hook "" .#update-version -- "${v}"
+  uv_exit=$?
+  set -e
+  if (( uv_exit != 0 )); then
+    failed+=("${v}")
+    echo "::warning title=Branch ${branch} skipped::update-version failed for ${v} (exit ${uv_exit}). Likely an upstream package.json / source defect at that release; see the orchestrator log above."
+    echo "  WARN: update-version failed for ${branch} (exit ${uv_exit}); skipping." >&2
+    popd >/dev/null
+    git worktree remove --force "${wt}" >/dev/null
+    continue
+  fi
   if ! git diff --quiet -- pin.nix flake.lock || [[ -n "$(git ls-files --others --exclude-standard -- flake.lock)" ]]; then
     git add pin.nix flake.lock
     git commit -q -m "auto: ${v} pin"
     git push --quiet origin "${branch}"
   else
     echo "  no change on ${branch}"
+    # Merge may have advanced HEAD without touching tracked files we diff for; push if local HEAD is ahead of origin.
+    if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${branch}")" ]]; then
+      git push --quiet origin "${branch}"
+    fi
   fi
   popd >/dev/null
   git worktree remove --force "${wt}" >/dev/null
 done
 
-# --- Compute aggregate targets ---
 git fetch --quiet origin
 declare -A agg_target_version=()
 record() { local key="$1" v="$2"; cur="${agg_target_version[$key]:-}"; if [[ -z "${cur}" ]] || version_lt "${cur}" "${v}"; then agg_target_version[$key]="${v}"; fi; }
 for v in "${tracked[@]}"; do
+  # Only consider exact branches that actually exist on origin (failed branches won't have a ref to advance aggregates to).
+  if ! git ls-remote --exit-code --heads origin "v${v}" >/dev/null 2>&1; then
+    continue
+  fi
   IFS='.' read -r M m _ <<<"${v}"
   record "main" "${v}"
   record "v${M}" "${v}"
   record "v${M}.${m}" "${v}"
 done
 
-# --- Move aggregate pointers ---
 echo
 echo "=== Updating aggregate pointers"
 for agg in "${!agg_target_version[@]}"; do
@@ -126,4 +154,22 @@ for agg in "${!agg_target_version[@]}"; do
 done
 
 echo
+if (( ${#failed[@]} > 0 )); then
+  echo "=== ${#failed[@]} branch(es) failed: ${failed[*]}"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+      echo "## :warning: ${#failed[@]} branch(es) failed to update"
+      echo
+      echo "These upstream versions couldn't be packaged (typically a broken upstream package.json or source). They were skipped; aggregate pointers reflect only the successful branches."
+      echo
+      for v in "${failed[@]}"; do
+        echo "- \`v${v}\`"
+      done
+      echo
+      echo "See the orchestrator log for the underlying error per version."
+    } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  exit 1
+fi
+
 echo "Done."
