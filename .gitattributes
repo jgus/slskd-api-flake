@@ -1,7 +1,6 @@
-# Per-branch ownership: when the orchestrator merges main into an existing
-# exact branch (to pick up orchestrator/workflow improvements), these files
-# stay as-is on the branch. The `ours` merge driver is configured at runtime
-# by update-branches.sh (`git config merge.ours.driver true`).
+# Per-branch ownership: when the orchestrator merges main into an existing exact
+# branch (to pick up orchestrator/workflow improvements), these files stay as-is on
+# the branch. The `ours` merge driver is configured at runtime by update-branches
+# (`git config merge.ours.driver true`).
 pin.nix     merge=ours
 flake.lock  merge=ours
-flake.nix   merge=ours
